@@ -1,4 +1,4 @@
-﻿#include "insert.hpp"
+#include "insert.hpp"
 #include "pdf_engine.hpp"
 #include <unordered_map>
 #include <vector>
@@ -569,7 +569,14 @@ static wz_matrix ComputePageCTM(const WinExtract::WinPageGeometry& geo) {
     float userunit = 1.0f;
     
     std::array<float, 4> mediabox = {geo.mediabox.x0, geo.mediabox.y0, geo.mediabox.x1, geo.mediabox.y1};
-    std::array<float, 4> cropbox = {geo.cropbox.x0, geo.cropbox.y0, geo.cropbox.x1, geo.cropbox.y1};
+    std::array<float, 4> cropbox = {
+        std::max(geo.cropbox.x0, geo.mediabox.x0),
+        std::max(geo.cropbox.y0, geo.mediabox.y0),
+        std::min(geo.cropbox.x1, geo.mediabox.x1),
+        std::min(geo.cropbox.y1, geo.mediabox.y1)
+    };
+    if (cropbox[0] > cropbox[2]) cropbox[2] = cropbox[0];
+    if (cropbox[1] > cropbox[3]) cropbox[3] = cropbox[1];
 
     int rotate = geo.rotate;
     if (rotate < 0) rotate = 360 - ((-rotate) % 360);
@@ -1917,4 +1924,3 @@ float MeasureTextWidth(const std::string& text, const std::string& font_path, fl
 
 } // namespace Winnerz
 #endif
-
