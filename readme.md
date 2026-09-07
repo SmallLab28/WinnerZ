@@ -1,7 +1,7 @@
 # WinnerZ Python Library Documentation
 
 ## Overview
-The `winnerz` library is a robust Python wrapper designed for processing, rendering, and manipulating PDF documents. It relies on a high-performance, multi-threaded C++ core extension (`winnerz_core`) for intensive operations while providing seamless fallback mechanisms and caching strategies in Python.
+`Winnerz` is a high-performance text extraction and insertion library built from scratch by SmallLab28 software.
 
 The architecture emphasizes blistering-fast text extraction, reliability, and fault-tolerance, specifically in handling binary dependencies, dynamic core library loading, and flexible preview rendering via PDFium.
 
