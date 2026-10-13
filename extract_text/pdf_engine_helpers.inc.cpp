@@ -208,7 +208,37 @@ static std::string to_lower_ascii(std::string s) {
     return s;
 }
 
+static std::string decode_pdf_name(const std::string& name) {
+    if (name.find('#') == std::string::npos) {
+        return name;
+    }
+    std::string out;
+    out.reserve(name.size());
+    for (size_t i = 0; i < name.size(); ++i) {
+        if (name[i] == '#' && i + 2 < name.size()) {
+            char h1 = name[i + 1];
+            char h2 = name[i + 2];
+            auto hex_val = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int v1 = hex_val(h1);
+            int v2 = hex_val(h2);
+            if (v1 >= 0 && v2 >= 0) {
+                out.push_back(static_cast<char>((v1 << 4) | v2));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(name[i]);
+    }
+    return out;
+}
+
 static std::string normalize_pdf_font_name(std::string name) {
+    name = decode_pdf_name(name);
     if (!name.empty() && name[0] == '/') {
         name.erase(name.begin());
     }
@@ -582,7 +612,7 @@ static std::string parse_name_token(const std::vector<uint8_t>& stream, size_t& 
     while (i < stream.size() && !is_white(stream[i]) && !is_delimiter(stream[i])) {
         ++i;
     }
-    return std::string(reinterpret_cast<const char*>(stream.data() + start), i - start);
+    return decode_pdf_name(std::string(reinterpret_cast<const char*>(stream.data() + start), i - start));
 }
 
 static double parse_number_token(const std::vector<uint8_t>& stream, size_t& i) {
@@ -1695,7 +1725,7 @@ static std::map<std::string, int> parse_font_refs_from_dict(const std::string& f
                font_dict[pos] != '[' && font_dict[pos] != ']' && font_dict[pos] != '(' && font_dict[pos] != ')') {
             ++pos;
         }
-        std::string name = font_dict.substr(name_start, pos - name_start);
+        std::string name = decode_pdf_name(font_dict.substr(name_start, pos - name_start));
         if (name.empty()) {
             // Pos is already at the character that stopped the scan (e.g. '/').
             // The next iteration of the outer loop will process it.
@@ -2129,7 +2159,7 @@ static std::string parse_name_value_after_key(const std::string& dict, const std
            dict[pos] != '[' && dict[pos] != ']' && dict[pos] != '(' && dict[pos] != ')') {
         ++pos;
     }
-    return dict.substr(start, pos - start);
+    return decode_pdf_name(dict.substr(start, pos - start));
 }
 
 static bool is_pdf_dict_delimiter(char c) {
@@ -3425,7 +3455,7 @@ static std::string parse_name_or_string_value_after_key(const std::string& dict,
                dict[pos] != '[' && dict[pos] != ']' && dict[pos] != '(' && dict[pos] != ')') {
             ++pos;
         }
-        return dict.substr(start, pos - start);
+        return decode_pdf_name(dict.substr(start, pos - start));
     }
 
     if (dict[pos] == '(') {
@@ -3753,7 +3783,7 @@ static void apply_differences_to_map(const std::string& dict, std::map<int, int>
                    dict[pos] != '/' && dict[pos] != '[' && dict[pos] != ']' && dict[pos] != '<' && dict[pos] != '>') {
                 ++pos;
             }
-            std::string gname = dict.substr(start, pos - start);
+            std::string gname = decode_pdf_name(dict.substr(start, pos - start));
             if (code >= 0 && code <= 255) {
                 if (names_out) {
                     (*names_out)[code] = gname;

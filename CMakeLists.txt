@@ -223,6 +223,8 @@ if(WINNERZ_BUILD_PYTHON_WRAPPER)
     
     if(UNIX AND NOT APPLE)
         target_link_options(winnerz_core PRIVATE "-Wl,--allow-multiple-definition")
+    elseif(MINGW)
+        target_link_options(winnerz_core PRIVATE "-Wl,--allow-multiple-definition" "-static-libgcc" "-static-libstdc++")
     elseif(MSVC)
         target_link_options(winnerz_core PRIVATE "/FORCE:MULTIPLE")
     endif()
@@ -240,20 +242,23 @@ if(WINNERZ_BUILD_PYTHON_WRAPPER)
         )
     endif()
 
+    set_target_properties(winnerz_core PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
+    )
+
     if(UNIX AND NOT APPLE)
         set_target_properties(winnerz_core PROPERTIES
             PREFIX ""
             OUTPUT_NAME "winnerz_core"
-            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
-            RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/winnerz/python"
             BUILD_RPATH "\$ORIGIN;\$ORIGIN/../third-party/pdfium/lib"
             INSTALL_RPATH "\$ORIGIN;\$ORIGIN/../third-party/pdfium/lib"
             BUILD_RPATH_USE_ORIGIN ON

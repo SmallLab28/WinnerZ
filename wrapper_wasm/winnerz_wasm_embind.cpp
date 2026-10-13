@@ -573,6 +573,25 @@ public:
         return out.dump();
     }
 
+    emscripten::val getFonts(int i) const {
+        checkPage(i);
+        const auto mm = doc_->get_page_font_vertical_metrics_map(i);
+        const auto name_to_id = doc_->get_page_font_name_to_id(i);
+        emscripten::val out = emscripten::val::array();
+        size_t idx = 0;
+        for (const auto& kv : mm) {
+            auto it = name_to_id.find(kv.first);
+            if (it != name_to_id.end()) {
+                emscripten::val font_obj = emscripten::val::object();
+                font_obj.set("font_obj_id", it->second);
+                font_obj.set("name", kv.first);
+                font_obj.set("basefont", kv.second.base_font);
+                out.set(idx++, font_obj);
+            }
+        }
+        return out;
+    }
+
     emscripten::val getImages(int i) const {
         checkPage(i);
         auto img_map = doc_->get_page_image_xobject_map(i);
@@ -895,6 +914,13 @@ public:
 #endif
     }
 
+    emscripten::val extractFont(int font_obj_id) const {
+        if (!doc_) return emscripten::val::null();
+        std::vector<uint8_t> font_data = doc_->get_embedded_font_stream(font_obj_id);
+        if (font_data.empty()) return emscripten::val::null();
+        return VecToVal(font_data);
+    }
+
 private:
     void checkPage(int i) const {
         if (i < 0 || i >= doc_->count_pages()) throw std::runtime_error("page_index out of range");
@@ -1100,6 +1126,7 @@ EMSCRIPTEN_BINDINGS(winnerz) {
         .function("getJson", &WasmDocument::getJson)
         .function("getAllDictsJson", &WasmDocument::getAllDictsJson)
         .function("getPageFontBasenames", &WasmDocument::getPageFontBasenames)
+        .function("getFonts", &WasmDocument::getFonts)
         .function("getImages", &WasmDocument::getImages)
         .function("getImagesJson", &WasmDocument::getImagesJson)
         .function("getDrawings", &WasmDocument::getDrawings)
@@ -1108,7 +1135,8 @@ EMSCRIPTEN_BINDINGS(winnerz) {
         .function("redactRects", &WasmDocument::redactRects)
         .function("insertTextToPagesJson", &WasmDocument::insertTextToPagesJson)
         .function("insertTextToPagesFitSpacingJson", &WasmDocument::insertTextToPagesFitSpacingJson)
-        .function("insertRectsToPagesJson", &WasmDocument::insertRectsToPagesJson);
+        .function("insertRectsToPagesJson", &WasmDocument::insertRectsToPagesJson)
+        .function("extractFont", &WasmDocument::extractFont);
 }
 
 #endif // __EMSCRIPTEN__

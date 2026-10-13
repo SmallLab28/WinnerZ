@@ -760,12 +760,20 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
             auto is_valid_scalar = [](int cp) {
                 return cp > 0 && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
             };
+            // Helper: raw glyph code is only usable as a character fallback when
+            // it falls in the printable Unicode range. Codes 0x01-0x1F are
+            // internal glyph IDs in subset fonts — emitting them raw produces ◆.
+            auto is_printable_fallback = [](int c) {
+                return c >= 32 && c <= 0x10FFFF && !(c >= 0xD800 && c <= 0xDFFF);
+            };
 
             if (seq.empty()) {
-                seq.push_back(code);
+                // Only fall back to raw code if it is a printable scalar.
+                if (is_printable_fallback(code)) {
+                    seq.push_back(code);
+                }
                 return false;
             }
-
 
             std::vector<int> clean;
             clean.reserve(seq.size());
@@ -776,7 +784,10 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
             }
 
             if (clean.empty()) {
-                clean.push_back(code);
+                // Same guard: only fall back to raw code if printable.
+                if (is_printable_fallback(code)) {
+                    clean.push_back(code);
+                }
                 seq.swap(clean);
                 return false;
             }
@@ -971,8 +982,14 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
             bool cid_fallback = false;
 
             if (unicode_seq.empty()) {
-                unicode_seq.push_back(code);
-                cid_fallback = false; 
+                // Only use raw glyph code as fallback when it is a printable
+                // Unicode scalar. Subset fonts reuse control-char slots (0x01-0x1F)
+                // as internal glyph codes; pushing those values raw causes ◆ output.
+                if (code >= 32 && code <= 0x10FFFF &&
+                    !(code >= 0xD800 && code <= 0xDFFF)) {
+                    unicode_seq.push_back(code);
+                }
+                cid_fallback = false;
             } else {
                 cid_fallback = sanitize_unicode_sequence(code, unicode_seq);
             }
@@ -1013,7 +1030,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
             }
 
             TextGlyphItem item;
-            item.primary = unicode_seq.front();
+            item.primary = unicode_seq.empty() ? 0 : unicode_seq.front();
             item.unicode_seq = std::move(unicode_seq);
             item.adv = adv_unscaled;
             item.m[0] = m[0]; item.m[1] = m[1]; item.m[2] = m[2];
@@ -1027,7 +1044,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
         
         if (at == nullptr || at->text.empty()) {
             for (const auto& item : glyphs) {
-                if (item.clipped) continue;
+                if (item.clipped || item.primary == 0) continue;
                 emit_rune(item.primary, item.adv, item.m, true, item.cid_fallback);
                 for (size_t si = 1; si < item.unicode_seq.size(); ++si) {
                     emit_rune(item.unicode_seq[si], 0.0f, item.m, false);
@@ -1043,7 +1060,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
         size_t actual_end = actual_len;
 
         for (start = 0; start < glyphs.size(); ++start) {
-            if (actual_start >= actual_len || glyphs[start].primary != at->text[actual_start]) {
+            if (actual_start >= actual_len || glyphs[start].primary == 0 || glyphs[start].primary != at->text[actual_start]) {
                 break;
             }
             actual_start++;
@@ -1051,7 +1068,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
 
         if (start != 0) {
             for (size_t i = 0; i < start; ++i) {
-                if (!glyphs[i].clipped) emit_rune(glyphs[i].primary, glyphs[i].adv, glyphs[i].m, true);
+                if (!glyphs[i].clipped && glyphs[i].primary != 0) emit_rune(glyphs[i].primary, glyphs[i].adv, glyphs[i].m, true);
             }
         }
 
@@ -1061,7 +1078,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
         }
 
         for (end = glyphs.size(); end > start; --end) {
-            if (actual_end <= actual_start || glyphs[end - 1].primary != at->text[actual_end - 1]) {
+            if (actual_end <= actual_start || glyphs[end - 1].primary == 0 || glyphs[end - 1].primary != at->text[actual_end - 1]) {
                 break;
             }
             actual_end--;
@@ -1077,7 +1094,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
 
             if (rune != -1) {
                 emit_rune(rune, glyphs[i].adv, glyphs[i].m, true);
-            } else {
+            } else if (glyphs[i].primary != 0) {
                 emit_rune(glyphs[i].primary, glyphs[i].adv, glyphs[i].m, false);
             }
         }
@@ -1106,7 +1123,7 @@ void WinPdfInterpreter::run(const std::vector<uint8_t>& stream,
 
         if (end != glyphs.size()) {
             for (size_t i = end; i < glyphs.size(); ++i) {
-                if (!glyphs[i].clipped) emit_rune(glyphs[i].primary, glyphs[i].adv, glyphs[i].m, true);
+                if (!glyphs[i].clipped && glyphs[i].primary != 0) emit_rune(glyphs[i].primary, glyphs[i].adv, glyphs[i].m, true);
             }
         }
 

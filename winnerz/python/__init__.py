@@ -841,6 +841,24 @@ class Document:
             return self._core_doc.get_page_font_basenames(page_index)
         return {}
 
+    def get_fonts(self, page_index=0):
+        """
+        Returns a list of dicts describing the fonts on a given page.
+        Each dict has 'font_obj_id', 'name', and 'basefont'.
+        """
+        if hasattr(self._core_doc, "get_fonts"):
+            return self._core_doc.get_fonts(page_index)
+        return []
+
+    def extract_font(self, font_obj_id):
+        """
+        Extracts the raw font bytes for a given font object ID.
+        Returns a bytes object or empty bytes if not found.
+        """
+        if hasattr(self._core_doc, "extract_font"):
+            return self._core_doc.extract_font(int(font_obj_id))
+        raise NotImplementedError("extract_font is not supported by the core")
+
     def save(self, path):
         with _silence_c_stderr():
             doc = self._get_pdfium_edit_doc()

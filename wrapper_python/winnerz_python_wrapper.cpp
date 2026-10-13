@@ -1644,6 +1644,48 @@ PYBIND11_MODULE(winnerz_core, m) {
                  return res;
              },
              py::arg("page_index") = 0)
+        .def("extract_font",
+             [](PyWinDocument& self, int font_obj_id) {
+                 std::vector<uint8_t> font_data;
+                 {
+                     py::gil_scoped_release release;
+                     if (self.doc) font_data = self.doc->get_embedded_font_stream(font_obj_id);
+                 }
+                 if (font_data.empty()) return py::bytes("");
+                 return py::bytes(reinterpret_cast<const char*>(font_data.data()), font_data.size());
+             },
+             py::arg("font_obj_id"))
+        .def("get_fonts",
+             [](PyWinDocument& self, int page_index) {
+                 py::list out;
+                 std::shared_ptr<WinExtract::WinPdfDocument> shared_doc;
+                 {
+                     py::gil_scoped_release release;
+                     shared_doc = self.doc;
+                 }
+                 if (!shared_doc) return out;
+                 
+                 WinExtract::WinFontVerticalMetricsMap mm;
+                 std::map<std::string, int> name_to_id;
+                 {
+                     py::gil_scoped_release release;
+                     mm = shared_doc->get_page_font_vertical_metrics_map(page_index);
+                     name_to_id = shared_doc->get_page_font_name_to_id(page_index);
+                 }
+                 
+                 for (const auto& kv : mm) {
+                     auto it = name_to_id.find(kv.first);
+                     if (it != name_to_id.end()) {
+                         py::dict font_obj;
+                         font_obj["font_obj_id"] = it->second;
+                         font_obj["name"] = kv.first;
+                         font_obj["basefont"] = kv.second.base_font;
+                         out.append(font_obj);
+                     }
+                 }
+                 return out;
+             },
+             py::arg("page_index") = 0)
         
                 .def("redact_pages_bytes",
              [](PyWinDocument& self,
