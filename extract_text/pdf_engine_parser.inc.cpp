@@ -695,13 +695,29 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
     std::string raw(file_view_.data(), file_view_.size());
 
     auto find_prev_startxref = [&](const std::string& src) -> long {
+        // PDF 1.7 spec 7.5.5: Search in last 4096 bytes for %%EOF and preceding startxref
+        size_t eof_pos = src.rfind("%%EOF");
+        if (eof_pos != std::string::npos) {
+            size_t window_start = (eof_pos > 4096) ? (eof_pos - 4096) : 0;
+            size_t pos = src.rfind("startxref", eof_pos);
+            if (pos != std::string::npos && pos >= window_start) {
+                size_t p = pos + 9;
+                while (p < src.size() && std::isspace(static_cast<unsigned char>(src[p]))) ++p;
+                char* end_ptr = nullptr;
+                long v = wz_strtol(src.c_str() + p, &end_ptr, 10);
+                if (end_ptr != src.c_str() + p && v >= 0 && static_cast<size_t>(v) < src.size()) {
+                    return v;
+                }
+            }
+        }
+        // Fallback: search backwards anywhere
         size_t pos = src.rfind("startxref");
         while (pos != std::string::npos) {
             size_t p = pos + 9;
             while (p < src.size() && std::isspace(static_cast<unsigned char>(src[p]))) ++p;
             char* end_ptr = nullptr;
             long v = wz_strtol(src.c_str() + p, &end_ptr, 10);
-            if (end_ptr != src.c_str() + p && v >= 0) return v;
+            if (end_ptr != src.c_str() + p && v >= 0 && static_cast<size_t>(v) < src.size()) return v;
             if (pos == 0) break;
             pos = src.rfind("startxref", pos - 1);
         }
@@ -720,18 +736,40 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
     if (prev_startxref < 0 || root_id <= 0) return {};
 
     std::string out = raw;
-    if (!out.empty() && out.back() != '\n' && out.back() != '\r') out.push_back('\n');
+    // Ensure clean newline at end of base PDF before appending new objects
+    if (!out.empty() && out.back() != '\n') {
+        out.push_back('\n');
+    }
 
-    struct XrefEntry { int id; size_t offset; };
-    std::vector<XrefEntry> changed;
+    struct XrefEntry {
+        int id;
+        int gen;
+        size_t offset;
+    };
+    std::map<int, XrefEntry> final_entries; // Unique by id, sorted
+
+    auto parse_gen = [](const std::string& content, int default_gen = 0) -> int {
+        size_t p = 0;
+        while (p < content.size() && std::isspace(static_cast<unsigned char>(content[p]))) p++;
+        while (p < content.size() && std::isdigit(static_cast<unsigned char>(content[p]))) p++;
+        while (p < content.size() && std::isspace(static_cast<unsigned char>(content[p]))) p++;
+        char* end_ptr = nullptr;
+        long g = wz_strtol(content.c_str() + p, &end_ptr, 10);
+        if (end_ptr != content.c_str() + p && g >= 0) return static_cast<int>(g);
+        return default_gen;
+    };
 
     // Append updated objects
     for (const auto& kv : updated_objects) {
         int id = kv.first;
         const std::string& content = kv.second;
-        changed.push_back({id, out.size()});
+        if (content.empty()) continue;
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
+        size_t offset = out.size();
+        int gen = parse_gen(content, 0);
+        final_entries[id] = {id, gen, offset};
         out += content;
-        if (!content.empty() && content.back() != '\n') out.push_back('\n');
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
     }
 
     // Append new objects
@@ -739,15 +777,26 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
     for (const auto& kv : new_objects) {
         int id = kv.first;
         const std::string& content = kv.second;
-        changed.push_back({id, out.size()});
+        if (content.empty()) continue;
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
+        size_t offset = out.size();
+        int gen = parse_gen(content, 0);
+        final_entries[id] = {id, gen, offset};
         out += content;
-        if (!content.empty() && content.back() != '\n') out.push_back('\n');
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
         current_max_id = (std::max)(current_max_id, id);
     }
 
-    if (changed.empty()) return {};
+    if (final_entries.empty()) return {};
 
-    std::sort(changed.begin(), changed.end(), [](const XrefEntry& a, const XrefEntry& b) { return a.id < b.id; });
+    std::vector<XrefEntry> changed;
+    changed.reserve(final_entries.size());
+    for (const auto& kv : final_entries) {
+        changed.push_back(kv.second);
+        current_max_id = (std::max)(current_max_id, kv.first);
+    }
+
+    if (!out.empty() && out.back() != '\n') out.push_back('\n');
 
     const size_t xref_offset = out.size();
     out += "xref\n";
@@ -757,27 +806,32 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
         while (j < changed.size() && changed[j].id == changed[j - 1].id + 1) ++j;
         out += std::to_string(changed[i].id) + " " + std::to_string(j - i) + "\n";
         for (size_t k = i; k < j; ++k) {
-            char entry[64];
-            std::snprintf(entry, sizeof(entry), "%010llu 00000 n \n", static_cast<unsigned long long>(changed[k].offset));
+            char entry[32];
+            std::snprintf(entry, sizeof(entry), "%010llu %05d n \n", 
+                          static_cast<unsigned long long>(changed[k].offset),
+                          changed[k].gen);
             out += entry;
         }
         i = j;
     }
 
-    auto extract_trailer_entries = [&](const std::string& src, long startxref_offset) -> std::string {
+    bool is_prev_stream = false;
+    auto extract_trailer_entries = [&](const std::string& src, long startxref_offset, bool& out_is_stream) -> std::string {
         std::string entries;
-        if (startxref_offset < 0 || startxref_offset >= src.size()) return entries;
-        size_t pos = startxref_offset;
+        out_is_stream = false;
+        if (startxref_offset < 0 || static_cast<size_t>(startxref_offset) >= src.size()) return entries;
+        size_t pos = static_cast<size_t>(startxref_offset);
         while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) pos++;
-        bool is_stream = false;
+        
         size_t dict_start = std::string::npos;
         if (pos + 4 <= src.size() && src.substr(pos, 4) == "xref") {
+            out_is_stream = false;
             size_t trailer_pos = src.find("trailer", pos);
             if (trailer_pos != std::string::npos) {
                 dict_start = src.find("<<", trailer_pos);
             }
         } else {
-            is_stream = true;
+            out_is_stream = true;
             dict_start = src.find("<<", pos);
         }
         
@@ -814,16 +868,21 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
                 }
             }
         }
-        if (is_stream) {
-            entries += " /XRefStm " + std::to_string(startxref_offset);
-        }
         return entries;
     };
 
-    std::string extra_trailer = extract_trailer_entries(raw, prev_startxref);
+    std::string extra_trailer = extract_trailer_entries(raw, prev_startxref, is_prev_stream);
     const int size_value = current_max_id + 1;
+    
+    std::string prev_link;
+    if (is_prev_stream) {
+        prev_link = " /XRefStm " + std::to_string(prev_startxref);
+    } else {
+        prev_link = " /Prev " + std::to_string(prev_startxref);
+    }
+
     out += "trailer\n<< /Size " + std::to_string(size_value) + " /Root " + std::to_string(root_id) +
-           " 0 R /Prev " + std::to_string(prev_startxref) + extra_trailer + " >>\nstartxref\n" +
+           " 0 R" + prev_link + extra_trailer + " >>\nstartxref\n" +
            std::to_string(xref_offset) + "\n%%EOF\n";
 
     return std::vector<uint8_t>(out.begin(), out.end());

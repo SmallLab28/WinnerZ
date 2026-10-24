@@ -779,7 +779,11 @@ static size_t find_matching_dict_end(const std::string& s, size_t start) {
 #include <mutex>
 static std::mutex g_fonts_mutex;
 static std::string g_fonts_loaded_dir = "";
-static std::vector<FontSlot> g_font_grid[2][2];
+struct FontGridHolder {
+    std::vector<FontSlot> grid[2][2];
+};
+static FontGridHolder* g_font_grid_holder = new FontGridHolder();
+#define g_font_grid (g_font_grid_holder->grid)
 static std::vector<std::vector<uint8_t>> g_full_charset_cache[2][2];
 static FT_Library g_ft_library = nullptr;
 static std::string NormalizeFontName(const std::string& name);
@@ -987,9 +991,9 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
 
     // Temporarily point GetFontSlot to use full_charset_cache â€” we do it inline:
     // Re-implement lookup using the saved caches directly.
-    auto GetFontSlotFast = [&](const WinInsertTextTask& task, const std::vector<uint32_t>& utf32) -> FontSlot* {
+    auto GetFontSlotFast = [&](const WinInsertTextTask& task, const std::string& task_ff_norm, const std::vector<uint32_t>& utf32, bool* out_full_match = nullptr) -> FontSlot* {
+        if (out_full_match) *out_full_match = false;
         if (utf32.empty()) return nullptr;
-        std::string task_ff_norm = NormalizeFontName(task.font_family);
         int req_b = task.bold ? 1 : 0;
         int req_i = task.italic ? 1 : 0;
 
@@ -1068,6 +1072,11 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
             }
         }
 
+        if (best) {
+            if (out_full_match) *out_full_match = true;
+            return best;
+        }
+
         // 4. PARTIAL MATCH: If no font has 100% coverage, pick the one with the highest coverage
         if (!best) {
             long long max_score = -1;
@@ -1140,13 +1149,8 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
         return best;
     };
 
-    auto make_font_selector = [&](const WinInsertTextTask& task) {
-        return [&](const std::vector<uint32_t>& run_utf32) -> FontSlot* {
-            return GetFontSlotFast(task, run_utf32);
-        };
-    };
-
     std::map<int, std::vector<FontSlot*>> precomputed_slots;
+    std::map<int, std::vector<std::vector<ShapedLine>>> precomputed_shaped_lines;
     std::set<FontSlot*> all_used_slots;
     for (const auto& item : pages_tasks) {
         int page_index = item.first;
@@ -1157,12 +1161,19 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
             // Translation engines sometimes output these which are missing from many fonts.
             NormalizeText(utf32);
             
-            FontSlot* primary_slot = GetFontSlotFast(task, utf32);
+            std::string task_ff_norm = NormalizeFontName(task.font_family);
+            bool primary_full_match = false;
+            FontSlot* primary_slot = GetFontSlotFast(task, task_ff_norm, utf32, &primary_full_match);
             precomputed_slots[page_index].push_back(primary_slot);
             if (primary_slot) all_used_slots.insert(primary_slot);
             
             auto tracking_font_selector = [&](const std::vector<uint32_t>& run_utf32) -> FontSlot* {
-                FontSlot* slot = GetFontSlotFast(task, run_utf32);
+                FontSlot* slot = nullptr;
+                if (primary_full_match && primary_slot) {
+                    slot = primary_slot;
+                } else {
+                    slot = GetFontSlotFast(task, task_ff_norm, run_utf32);
+                }
                 if (slot) {
                     slot->used = true;
                     for (uint32_t cp : run_utf32) slot->used_codepoints.insert(cp);
@@ -1174,13 +1185,15 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
             std::string clean_text = Utf32ToUtf8(utf32);
             clean_text.erase(std::remove(clean_text.begin(), clean_text.end(), '\r'), clean_text.end());
             
+            std::vector<ShapedLine> task_lines;
             if (task.multiline) {
                 std::lock_guard<std::mutex> lock(global_shaping_mutex);
-                HarfbuzzWordWrap(clean_text, tracking_font_selector, task.font_size, task.x1 - task.x0);
+                task_lines = HarfbuzzWordWrap(clean_text, tracking_font_selector, task.font_size, task.x1 - task.x0);
             } else {
                 std::lock_guard<std::mutex> lock(global_shaping_mutex);
-                HarfbuzzWordWrap(clean_text, tracking_font_selector, task.font_size, 1e9f);
+                task_lines = HarfbuzzWordWrap(clean_text, tracking_font_selector, task.font_size, 1e9f);
             }
+            precomputed_shaped_lines[page_index].push_back(std::move(task_lines));
         }
     }
     auto t_font_resolve = std::chrono::high_resolution_clock::now();
@@ -1464,54 +1477,38 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
             // Reset all text state parameters to isolate from previous content streams
             page_stream += "0 Tc 0 Tw 100 Tz 0 TL 0 Tr 0 Ts\n";
 
-            std::vector<FontSlot*> p_slots = precomputed_slots[page_index];
+            const std::vector<FontSlot*>& p_slots = precomputed_slots[page_index];
+            const auto& page_precomputed_lines = precomputed_shaped_lines[page_index];
             size_t task_idx = 0;
 
             for (const auto& task : tasks) {
                 float bbox_w = task.x1 - task.x0;
                 float bbox_h = task.y1 - task.y0;
-                FontSlot* slot = p_slots[task_idx++];
+                size_t cur_task_idx = task_idx++;
+                FontSlot* slot = (cur_task_idx < p_slots.size()) ? p_slots[cur_task_idx] : nullptr;
                 if (bbox_w <= 0 || bbox_h <= 0 || !slot) continue;
 
                 const std::string& cur_font_name = slot->pdf_name;
-                auto font_selector = make_font_selector(task);
-
                 float fs = task.font_size;
-                std::vector<ShapedLine> lines;
-                
-                std::vector<uint32_t> run_utf32_norm = Utf8ToUtf32(task.text);
-                NormalizeText(run_utf32_norm);
-                std::string clean_text = Utf32ToUtf8(run_utf32_norm);
-                clean_text.erase(std::remove(clean_text.begin(), clean_text.end(), '\r'), clean_text.end());
+                if (cur_task_idx >= page_precomputed_lines.size()) continue;
+                const std::vector<ShapedLine>& lines = page_precomputed_lines[cur_task_idx];
+                if (lines.empty()) continue;
 
                 float spacing_ratio = 1.0f;
-                if (task.multiline) {
-                    std::lock_guard<std::mutex> lock(global_shaping_mutex);
-                    lines = HarfbuzzWordWrap(clean_text, font_selector, fs, bbox_w);
-                } else {
-                    {
-                        std::lock_guard<std::mutex> lock(global_shaping_mutex);
-                        lines = HarfbuzzWordWrap(clean_text, font_selector, fs, 1e9f);
-                    }
-                    
-                    if (!lines.empty()) {
-                        float total_w = 0.0f;
-                        for (const auto& ln : lines) total_w += ln.width;
+                float fs_scale = 1.0f;
+                if (!task.multiline) {
+                    float total_w = 0.0f;
+                    for (const auto& ln : lines) total_w += ln.width;
 
-                        if (total_w > bbox_w && total_w > 0.0f) {
-                            if (fit_by_spacing) {
-                                spacing_ratio = bbox_w / total_w;
-                            } else {
-                                fs = fs * (bbox_w / total_w);
-                                {
-                                    std::lock_guard<std::mutex> lock(global_shaping_mutex);
-                                    lines = HarfbuzzWordWrap(clean_text, font_selector, fs, 1e9f);
-                                }
-                            }
+                    if (total_w > bbox_w && total_w > 0.0f) {
+                        if (fit_by_spacing) {
+                            spacing_ratio = bbox_w / total_w;
+                        } else {
+                            fs_scale = bbox_w / total_w;
+                            fs = fs * fs_scale;
                         }
                     }
                 }
-                if (lines.empty()) continue;
 
                 auto to_pdf = [&inv_ctm](float xi, float yi) -> std::pair<float, float> {
                     return { xi * inv_ctm.a + yi * inv_ctm.c + inv_ctm.e, xi * inv_ctm.b + yi * inv_ctm.d + inv_ctm.f };
@@ -1562,11 +1559,16 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
                 float skew = synth_italic ? 0.2125f : 0.0f;
 
                 bool is_rtl_line = false;
-                std::vector<uint32_t> utf32 = Utf8ToUtf32(clean_text);
-                for (uint32_t c : utf32) {
-                    int bc = ucdn_get_bidi_class(c);
-                    if (bc == UCDN_BIDI_CLASS_R || bc == UCDN_BIDI_CLASS_AL || bc == UCDN_BIDI_CLASS_RLE || bc == UCDN_BIDI_CLASS_RLO) {
-                        is_rtl_line = true;
+                for (unsigned char c : task.text) {
+                    if (c >= 0xD8) {
+                        std::vector<uint32_t> utf32 = Utf8ToUtf32(task.text);
+                        for (uint32_t cp : utf32) {
+                            int bc = ucdn_get_bidi_class(cp);
+                            if (bc == UCDN_BIDI_CLASS_R || bc == UCDN_BIDI_CLASS_AL || bc == UCDN_BIDI_CLASS_RLE || bc == UCDN_BIDI_CLASS_RLO) {
+                                is_rtl_line = true;
+                                break;
+                            }
+                        }
                         break;
                     }
                 }
@@ -1584,12 +1586,12 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
                     }
 
                     for (const auto& g : line.glyphs) {
-                        float xi = cur_x_img + g.x_offset;
-                        float yi = cur_y_img + g.y_offset;
+                        float xi = cur_x_img + g.x_offset * fs_scale;
+                        float yi = cur_y_img + g.y_offset * fs_scale;
 
                         auto [xp, yp] = to_pdf(xi, yi);
 
-                        std::string g_font = g.font_pdf_name ? *g.font_pdf_name : cur_font_name;
+                        std::string g_font = (g.slot && !g.slot->pdf_name.empty()) ? g.slot->pdf_name : (g.font_pdf_name && !g.font_pdf_name->empty() ? *g.font_pdf_name : cur_font_name);
                         if (g_font != active_font_name) {
                             char font_buf[128];
                             snprintf(font_buf, sizeof(font_buf), "%s %.3f Tf\n", g_font.c_str(), fs);
@@ -1603,7 +1605,7 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
                         sanitize_commas(tm_buf);
                         page_stream += tm_buf;
                         page_stream += create_hex_string_single(g.id) + " Tj\n";
-                        cur_x_img += g.x_advance * line_spacing_ratio;
+                        cur_x_img += g.x_advance * fs_scale * line_spacing_ratio;
                     }
                     cur_y_img += fs * 1.2f;
                 }
@@ -1872,52 +1874,60 @@ std::vector<uint8_t> InsertRectsToMultiplePages(WinExtract::WinPdfDocument* doc,
     
     return result;
 }
+struct CachedMeasureFace {
+    FT_Face face = nullptr;
+    hb_font_t* hb_font = nullptr;
+    float upem = 1000.0f;
+};
+static std::mutex g_measure_cache_mutex;
+static FT_Library g_measure_ft_library = nullptr;
+static std::unordered_map<std::string, CachedMeasureFace> g_measure_faces;
+
 float MeasureTextWidth(const std::string& text, const std::string& font_path, float font_size, bool is_bold, bool is_italic) {
 #ifndef WINEXTRACT_USE_FREETYPE
     return 0.0f;
 #else
-    if (text.empty() || font_path.empty()) return 0.0f;
-    std::lock_guard<std::mutex> lock(global_shaping_mutex);
+    if (text.empty() || font_path.empty() || font_size <= 0.0f) return 0.0f;
+    std::lock_guard<std::mutex> lock(g_measure_cache_mutex);
 
-    FT_Library ft_library = nullptr;
-    if (FT_Init_FreeType(&ft_library)) return 0.0f;
-
-    FT_Face ft_face = nullptr;
-    if (FT_New_Face(ft_library, font_path.c_str(), 0, &ft_face)) {
-        FT_Done_FreeType(ft_library);
-        return 0.0f;
+    if (!g_measure_ft_library) {
+        if (FT_Init_FreeType(&g_measure_ft_library)) return 0.0f;
     }
 
-    FT_Set_Char_Size(ft_face, 0, (int)(font_size * 64), 72, 72);
-
-    hb_font_t* hb_font = hb_ft_font_create(ft_face, NULL);
-    if (!hb_font) {
-        FT_Done_Face(ft_face);
-        FT_Done_FreeType(ft_library);
-        return 0.0f;
+    auto it = g_measure_faces.find(font_path);
+    if (it == g_measure_faces.end()) {
+        CachedMeasureFace cached;
+        if (FT_New_Face(g_measure_ft_library, font_path.c_str(), 0, &cached.face) != 0) {
+            return 0.0f;
+        }
+        cached.upem = cached.face->units_per_EM > 0 ? (float)cached.face->units_per_EM : 1000.0f;
+        FT_Set_Pixel_Sizes(cached.face, (FT_UInt)cached.upem, (FT_UInt)cached.upem);
+        cached.hb_font = hb_ft_font_create(cached.face, NULL);
+        if (!cached.hb_font) {
+            FT_Done_Face(cached.face);
+            return 0.0f;
+        }
+        hb_ft_font_set_funcs(cached.hb_font);
+        it = g_measure_faces.emplace(font_path, cached).first;
     }
 
+    const CachedMeasureFace& cached = it->second;
     hb_buffer_t* hb_buffer = hb_buffer_create();
     hb_buffer_add_utf8(hb_buffer, text.c_str(), -1, 0, -1);
     hb_buffer_guess_segment_properties(hb_buffer);
     
-    hb_shape(hb_font, hb_buffer, NULL, 0);
+    hb_shape(cached.hb_font, hb_buffer, NULL, 0);
 
     unsigned int glyph_count;
     hb_glyph_position_t* glyph_pos = hb_buffer_get_glyph_positions(hb_buffer, &glyph_count);
     
-    float total_width = 0.0f;
+    float total_advance = 0.0f;
     for (unsigned int i = 0; i < glyph_count; ++i) {
-        total_width += glyph_pos[i].x_advance;
+        total_advance += glyph_pos[i].x_advance;
     }
-    
-    total_width = total_width / 64.0f;
-    
     hb_buffer_destroy(hb_buffer);
-    hb_font_destroy(hb_font);
-    FT_Done_Face(ft_face);
-    FT_Done_FreeType(ft_library);
 
+    float total_width = (total_advance / (cached.upem * 64.0f)) * font_size;
     return total_width;
 #endif
 }

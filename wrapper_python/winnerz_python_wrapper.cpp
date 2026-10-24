@@ -1928,15 +1928,6 @@ PYBIND11_MODULE(winnerz_core, m) {
                  }
                  
                  py::bytes out_bytes = pybind11::bytes(reinterpret_cast<const char*>(merged_bytes.data()), merged_bytes.size());
-                 
-#if defined(WINNERZ_USE_PDFIUM_PREVIEW) && WINNERZ_USE_PDFIUM_PREVIEW
-                 try {
-                     PyPdfiumEditorDoc repair_doc(out_bytes);
-                     out_bytes = repair_doc.save();
-                 } catch (...) {
-                     // Fallback to original bytes if repair fails
-                 }
-#endif
                  return out_bytes;
 #else
                  throw std::runtime_error("insert_text_to_pages_json is not supported (PDFium not available)");
@@ -2003,15 +1994,6 @@ PYBIND11_MODULE(winnerz_core, m) {
                  }
                  
                  py::bytes out_bytes = pybind11::bytes(reinterpret_cast<const char*>(merged_bytes.data()), merged_bytes.size());
-                 
-#if defined(WINNERZ_USE_PDFIUM_PREVIEW) && WINNERZ_USE_PDFIUM_PREVIEW
-                 try {
-                     PyPdfiumEditorDoc repair_doc(out_bytes);
-                     out_bytes = repair_doc.save();
-                 } catch (...) {
-                     // Fallback to original bytes if repair fails
-                 }
-#endif
                  return out_bytes;
 #else
                  throw std::runtime_error("insert_text_to_pages_json is not supported (PDFium not available)");
