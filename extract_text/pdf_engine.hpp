@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <ctime>
 #include "extractor_logic.hpp"
 #include "decoder_inflate.hpp"
 #include "mapped_file.hpp"

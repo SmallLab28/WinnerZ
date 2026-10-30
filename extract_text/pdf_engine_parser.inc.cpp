@@ -686,6 +686,133 @@ int WinPdfDocument::get_max_obj_id() {
     max_obj_id = (std::max)(max_obj_id, root_id);
     return max_obj_id;
 }
+static std::string format_pdf_current_date() {
+    std::time_t now = std::time(nullptr);
+    std::tm tm_buf{};
+#if defined(_WIN32) || defined(_WIN64)
+    gmtime_s(&tm_buf, &now);
+#else
+    gmtime_r(&now, &tm_buf);
+#endif
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "D:%04d%02d%02d%02d%02d%02dZ",
+                  tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                  tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    return std::string(buf);
+}
+
+static std::string remove_pdf_dict_entry(const std::string& dict, const std::string& key) {
+    std::string res;
+    res.reserve(dict.size());
+    size_t i = 0;
+    while (i < dict.size()) {
+        // Skip literal string (...)
+        if (dict[i] == '(') {
+            int depth = 0;
+            while (i < dict.size()) {
+                if (dict[i] == '\\' && i + 1 < dict.size()) {
+                    res += dict[i++];
+                    res += dict[i++];
+                    continue;
+                }
+                if (dict[i] == '(') depth++;
+                else if (dict[i] == ')') {
+                    depth--;
+                    res += dict[i++];
+                    if (depth <= 0) break;
+                    continue;
+                }
+                res += dict[i++];
+            }
+            continue;
+        }
+        // Skip hex string <...> (not <<)
+        if (dict[i] == '<') {
+            if (i + 1 < dict.size() && dict[i + 1] == '<') {
+                res += "<<";
+                i += 2;
+                continue;
+            }
+            while (i < dict.size()) {
+                res += dict[i++];
+                if (dict[i - 1] == '>') break;
+            }
+            continue;
+        }
+        // Check key match at dictionary level
+        if (dict[i] == '/') {
+            if (dict.compare(i, key.size(), key) == 0) {
+                size_t after_key = i + key.size();
+                char next_c = (after_key < dict.size()) ? dict[after_key] : ' ';
+                if (std::isspace(static_cast<unsigned char>(next_c)) || next_c == '/' ||
+                    next_c == '(' || next_c == '<' || next_c == '[' || next_c == '>' || next_c == '%') {
+                    // Match found: skip key and its value
+                    size_t p = after_key;
+                    while (p < dict.size() && std::isspace(static_cast<unsigned char>(dict[p]))) p++;
+                    if (p < dict.size()) {
+                        if (dict[p] == '(') {
+                            int d = 0;
+                            while (p < dict.size()) {
+                                if (dict[p] == '\\' && p + 1 < dict.size()) { p += 2; continue; }
+                                if (dict[p] == '(') d++;
+                                else if (dict[p] == ')') { d--; if (d <= 0) { p++; break; } }
+                                p++;
+                            }
+                        } else if (dict[p] == '<') {
+                            if (p + 1 < dict.size() && dict[p + 1] == '<') {
+                                int d = 0;
+                                while (p + 1 < dict.size()) {
+                                    if (dict[p] == '<' && dict[p + 1] == '<') { d++; p += 2; }
+                                    else if (dict[p] == '>' && dict[p + 1] == '>') { d--; p += 2; if (d <= 0) break; }
+                                    else p++;
+                                }
+                            } else {
+                                while (p < dict.size() && dict[p] != '>') p++;
+                                if (p < dict.size()) p++;
+                            }
+                        } else if (dict[p] == '[') {
+                            int d = 0;
+                            while (p < dict.size()) {
+                                if (dict[p] == '[') d++;
+                                else if (dict[p] == ']') { d--; if (d <= 0) { p++; break; } }
+                                p++;
+                            }
+                        } else {
+                            char* end_ptr = nullptr;
+                            long obj_num = wz_strtol(dict.c_str() + p, &end_ptr, 10);
+                            bool is_ref = false;
+                            if (end_ptr != dict.c_str() + p) {
+                                size_t p2 = end_ptr - dict.c_str();
+                                while (p2 < dict.size() && std::isspace(static_cast<unsigned char>(dict[p2]))) p2++;
+                                char* end_ptr2 = nullptr;
+                                long gen_num = wz_strtol(dict.c_str() + p2, &end_ptr2, 10);
+                                if (end_ptr2 != dict.c_str() + p2) {
+                                    size_t p3 = end_ptr2 - dict.c_str();
+                                    while (p3 < dict.size() && std::isspace(static_cast<unsigned char>(dict[p3]))) p3++;
+                                    if (p3 < dict.size() && dict[p3] == 'R') {
+                                        p = p3 + 1;
+                                        is_ref = true;
+                                    }
+                                }
+                            }
+                            if (!is_ref) {
+                                while (p < dict.size() && !std::isspace(static_cast<unsigned char>(dict[p])) &&
+                                       dict[p] != '/' && dict[p] != '>') {
+                                    p++;
+                                }
+                            }
+                        }
+                    }
+                    i = p;
+                    continue;
+                }
+            }
+        }
+        res += dict[i++];
+    }
+    return res;
+}
+
 
 std::vector<uint8_t> WinPdfDocument::save_incremental_update(
         const std::map<int, std::string>& updated_objects,
@@ -787,6 +914,95 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
         current_max_id = (std::max)(current_max_id, id);
     }
 
+    bool is_prev_stream = false;
+    std::string extra_id_entry;
+    int old_info_id = 0;
+
+    auto parse_trailer_info_and_id = [&](const std::string& src, long startxref_offset) {
+        if (startxref_offset < 0 || static_cast<size_t>(startxref_offset) >= src.size()) return;
+        size_t pos = static_cast<size_t>(startxref_offset);
+        while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) pos++;
+        
+        size_t dict_start = std::string::npos;
+        if (pos + 4 <= src.size() && src.substr(pos, 4) == "xref") {
+            is_prev_stream = false;
+            size_t trailer_pos = src.find("trailer", pos);
+            if (trailer_pos != std::string::npos) {
+                dict_start = src.find("<<", trailer_pos);
+            }
+        } else {
+            is_prev_stream = true;
+            dict_start = src.find("<<", pos);
+        }
+        
+        if (dict_start != std::string::npos) {
+            int depth = 0;
+            size_t dict_end = std::string::npos;
+            for (size_t k = dict_start; k < src.size(); k++) {
+                if (src[k] == '<' && k + 1 < src.size() && src[k+1] == '<') { depth++; k++; }
+                else if (src[k] == '>' && k + 1 < src.size() && src[k+1] == '>') {
+                    depth--; k++;
+                    if (depth == 0) { dict_end = k - 1; break; }
+                }
+            }
+            if (dict_end != std::string::npos) {
+                std::string dict_content = src.substr(dict_start + 2, dict_end - dict_start - 2);
+                size_t id_pos = dict_content.find("/ID");
+                if (id_pos != std::string::npos) {
+                    size_t arr_start = dict_content.find("[", id_pos);
+                    if (arr_start != std::string::npos) {
+                        size_t arr_end = dict_content.find("]", arr_start);
+                        if (arr_end != std::string::npos) {
+                            extra_id_entry = " /ID " + dict_content.substr(arr_start, arr_end - arr_start + 1);
+                        }
+                    }
+                }
+                size_t info_pos = dict_content.find("/Info");
+                if (info_pos != std::string::npos) {
+                    size_t v_start = info_pos + 5;
+                    while (v_start < dict_content.size() && std::isspace(static_cast<unsigned char>(dict_content[v_start]))) v_start++;
+                    char* end_ptr = nullptr;
+                    long v = wz_strtol(dict_content.c_str() + v_start, &end_ptr, 10);
+                    if (end_ptr != dict_content.c_str() + v_start && v > 0) {
+                        old_info_id = static_cast<int>(v);
+                    }
+                }
+            }
+        }
+    };
+
+    parse_trailer_info_and_id(raw, prev_startxref);
+
+    // Inject Winnerz Engine Metadata Info Object (Weapon 2: smallLab28 signature)
+    std::string final_info_dict;
+    std::string pdf_date = format_pdf_current_date();
+    if (old_info_id > 0) {
+        WinPdfObject old_info = read_obj(old_info_id);
+        if (!old_info.dict.empty()) {
+            final_info_dict = old_info.dict;
+            final_info_dict = remove_pdf_dict_entry(final_info_dict, "/Producer");
+            final_info_dict = remove_pdf_dict_entry(final_info_dict, "/ModDate");
+            final_info_dict = remove_pdf_dict_entry(final_info_dict, "/EngineSignature");
+            size_t last_bracket = final_info_dict.rfind(">>");
+            if (last_bracket != std::string::npos) {
+                final_info_dict.insert(last_bracket, " /Producer (Winnerz PDF Engine - smallLab28) /EngineSignature (Licensed to Winnerz / smallLab28) /ModDate (" + pdf_date + ") ");
+            } else {
+                final_info_dict.clear();
+            }
+        }
+    }
+    if (final_info_dict.empty()) {
+        final_info_dict = "<< /Producer (Winnerz PDF Engine - smallLab28) /Creator (Winnerz Core) /EngineSignature (Licensed to Winnerz / smallLab28) /ModDate (" + pdf_date + ") >>";
+    }
+
+    int info_obj_id = ++current_max_id;
+    if (!out.empty() && out.back() != '\n') out.push_back('\n');
+    size_t info_offset = out.size();
+    std::string info_obj_str = std::to_string(info_obj_id) + " 0 obj\n" + final_info_dict + "\nendobj\n";
+    out += info_obj_str;
+    if (!out.empty() && out.back() != '\n') out.push_back('\n');
+    final_entries[info_obj_id] = {info_obj_id, 0, info_offset};
+
     if (final_entries.empty()) return {};
 
     std::vector<XrefEntry> changed;
@@ -815,65 +1031,6 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
         i = j;
     }
 
-    bool is_prev_stream = false;
-    auto extract_trailer_entries = [&](const std::string& src, long startxref_offset, bool& out_is_stream) -> std::string {
-        std::string entries;
-        out_is_stream = false;
-        if (startxref_offset < 0 || static_cast<size_t>(startxref_offset) >= src.size()) return entries;
-        size_t pos = static_cast<size_t>(startxref_offset);
-        while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) pos++;
-        
-        size_t dict_start = std::string::npos;
-        if (pos + 4 <= src.size() && src.substr(pos, 4) == "xref") {
-            out_is_stream = false;
-            size_t trailer_pos = src.find("trailer", pos);
-            if (trailer_pos != std::string::npos) {
-                dict_start = src.find("<<", trailer_pos);
-            }
-        } else {
-            out_is_stream = true;
-            dict_start = src.find("<<", pos);
-        }
-        
-        if (dict_start != std::string::npos) {
-            int depth = 0;
-            size_t dict_end = std::string::npos;
-            for (size_t k = dict_start; k < src.size(); k++) {
-                if (src[k] == '<' && k + 1 < src.size() && src[k+1] == '<') { depth++; k++; }
-                else if (src[k] == '>' && k + 1 < src.size() && src[k+1] == '>') {
-                    depth--; k++;
-                    if (depth == 0) { dict_end = k - 1; break; }
-                }
-            }
-            if (dict_end != std::string::npos) {
-                std::string dict_content = src.substr(dict_start + 2, dict_end - dict_start - 2);
-                size_t id_pos = dict_content.find("/ID");
-                if (id_pos != std::string::npos) {
-                    size_t arr_start = dict_content.find("[", id_pos);
-                    if (arr_start != std::string::npos) {
-                        size_t arr_end = dict_content.find("]", arr_start);
-                        if (arr_end != std::string::npos) {
-                            entries += " /ID " + dict_content.substr(arr_start, arr_end - arr_start + 1);
-                        }
-                    }
-                }
-                size_t info_pos = dict_content.find("/Info");
-                if (info_pos != std::string::npos) {
-                    size_t v_start = info_pos + 5;
-                    while (v_start < dict_content.size() && std::isspace(static_cast<unsigned char>(dict_content[v_start]))) v_start++;
-                    size_t r_pos = dict_content.find(" R", v_start);
-                    if (r_pos != std::string::npos) {
-                        entries += " /Info " + dict_content.substr(v_start, r_pos - v_start + 2);
-                    }
-                }
-            }
-        }
-        return entries;
-    };
-
-    std::string extra_trailer = extract_trailer_entries(raw, prev_startxref, is_prev_stream);
-    const int size_value = current_max_id + 1;
-    
     std::string prev_link;
     if (is_prev_stream) {
         prev_link = " /XRefStm " + std::to_string(prev_startxref);
@@ -881,8 +1038,9 @@ std::vector<uint8_t> WinPdfDocument::save_incremental_update(
         prev_link = " /Prev " + std::to_string(prev_startxref);
     }
 
+    const int size_value = current_max_id + 1;
     out += "trailer\n<< /Size " + std::to_string(size_value) + " /Root " + std::to_string(root_id) +
-           " 0 R" + prev_link + extra_trailer + " >>\nstartxref\n" +
+           " 0 R" + prev_link + " /Info " + std::to_string(info_obj_id) + " 0 R" + extra_id_entry + " >>\nstartxref\n" +
            std::to_string(xref_offset) + "\n%%EOF\n";
 
     return std::vector<uint8_t>(out.begin(), out.end());
