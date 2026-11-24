@@ -32,6 +32,11 @@ static std::mutex global_shaping_mutex;
 #include "../extract_text/ucdn.hpp"
 #include "../extract_text/bidi_imp.hpp"
 
+/* Keep LaTeXF resource names distinct from fonts already present in a host PDF. */
+#define LATEXF_PDF_FONT_NORMAL_NAME "WZLTXR"
+#define LATEXF_PDF_FONT_ITALIC_NAME "WZLTXI"
+#include "latexf.h"
+
 namespace Winnerz {
 
 static std::vector<uint32_t> Utf8ToUtf32(const std::string& utf8);
@@ -902,6 +907,105 @@ static std::string NormalizeFontName(const std::string& name) {
     return out;
 }
 
+static bool IsLatexCommand(const std::string& command) {
+    if (find_symbol(command.c_str())) return true;
+    static const std::unordered_set<std::string> structural = {
+        "frac", "dfrac", "tfrac", "sqrt", "left", "right", "middle",
+        "begin", "end", "text", "textnormal", "textrm", "textbf", "textit",
+        "mathcal", "mathbb", "mathfrak", "mathbf", "boldsymbol", "mathrm",
+        "mathit", "operatorname", "overset", "underset", "overline", "underline",
+        "widehat", "widetilde", "overbrace", "underbrace", "substack", "overset",
+        "xrightarrow", "xleftarrow", "color", "textcolor", "boxed", "cancel",
+        "phantom", "hphantom", "vphantom", "smash", "hspace", "kern", "mkern",
+        "limits", "nolimits", "displaystyle", "scriptstyle", "pmod", "tag", "genfrac"
+    };
+    return structural.find(command) != structural.end();
+}
+
+static bool LooksLikeLatexFormula(const std::string& text) {
+    size_t first = text.find_first_not_of(" \t\r\n");
+    size_t last = text.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos) return false;
+    const std::string trimmed = text.substr(first, last - first + 1);
+    if ((trimmed.size() >= 2 && trimmed.front() == '$' && trimmed.back() == '$') ||
+        (trimmed.size() >= 4 && trimmed.compare(0, 2, "$$") == 0 && trimmed.compare(trimmed.size() - 2, 2, "$$") == 0) ||
+        (trimmed.size() >= 4 && (trimmed.compare(0, 2, "\\[") == 0 || trimmed.compare(0, 2, "\\(" ) == 0) &&
+         (trimmed.compare(trimmed.size() - 2, 2, "\\]") == 0 || trimmed.compare(trimmed.size() - 2, 2, "\\)") == 0))) {
+        return true;
+    }
+
+    for (size_t i = 0; i + 1 < text.size(); ++i) {
+        if (text[i] != '\\') continue;
+        if (text[i + 1] == '\\') continue; // Also recognize JSON/C-escaped commands on the second slash.
+        if (text[i + 1] == '(' || text[i + 1] == '[') return true;
+        if (!std::isalpha(static_cast<unsigned char>(text[i + 1]))) continue;
+        size_t end = i + 1;
+        while (end < text.size() && std::isalpha(static_cast<unsigned char>(text[end]))) ++end;
+        if (IsLatexCommand(text.substr(i + 1, end - i - 1))) return true;
+        i = end - 1;
+    }
+    return false;
+}
+
+static bool RenderLatexTask(int page_index,
+                            const WinExtract::WinPageGeometry& geo, const WinInsertTextTask& task,
+                            std::string& out_stream) {
+    std::array<float, 4> cropbox = {
+        std::max(geo.cropbox.x0, geo.mediabox.x0),
+        std::max(geo.cropbox.y0, geo.mediabox.y0),
+        std::min(geo.cropbox.x1, geo.mediabox.x1),
+        std::min(geo.cropbox.y1, geo.mediabox.y1)
+    };
+    if (cropbox[0] > cropbox[2]) cropbox[2] = cropbox[0];
+    if (cropbox[1] > cropbox[3]) cropbox[3] = cropbox[1];
+    const wz_matrix page_ctm = ComputePageCTM(geo);
+    const wz_matrix inv_ctm = wz_invert_matrix(page_ctm);
+    const std::array<float, 4> visible_box = wz_transform_rect(cropbox, page_ctm);
+    const double page_w = visible_box[2] - visible_box[0];
+    const double page_h = visible_box[3] - visible_box[1];
+    if (page_w <= 0.0 || page_h <= 0.0 || task.x1 <= task.x0 || task.y1 <= task.y0) return false;
+
+    LatexfRenderOptions options = latexf_render_options_default();
+    options.page_width_pt = page_w;
+    options.page_height_pt = page_h;
+    options.target_page_1based = page_index + 1;
+    options.bbox_x_pt = task.x0;
+    options.bbox_y_pt = task.y0;
+    options.bbox_width_pt = task.x1 - task.x0;
+    options.bbox_height_pt = task.y1 - task.y0;
+    options.font_size_pt = task.font_size;
+    options.padding_pt = 0.0;
+    options.color_rgb = (static_cast<unsigned int>(std::clamp(task.r, 0, 255)) << 16) |
+                        (static_cast<unsigned int>(std::clamp(task.g, 0, 255)) << 8) |
+                         static_cast<unsigned int>(std::clamp(task.b, 0, 255));
+    options.align = LATEXF_ALIGN_LEFT;
+    options.vertical_align = LATEXF_VALIGN_CENTER;
+    options.fit = LATEXF_FIT_SHRINK;
+    options.origin = LATEXF_ORIGIN_TOP_LEFT;
+
+    char* content = nullptr;
+    size_t content_length = 0;
+    if (!latexf_render_to_content(task.text.c_str(), &options, &content, &content_length, nullptr)) return false;
+
+    /* The renderer emits in a bottom-left, rotated-page coordinate system. Convert
+       that system through the same inverse page CTM used for ordinary inserted text. */
+    const double a = inv_ctm.a;
+    const double b = inv_ctm.b;
+    const double c = -inv_ctm.c;
+    const double d = -inv_ctm.d;
+    const double e = inv_ctm.e + inv_ctm.c * page_h;
+    const double f = inv_ctm.f + inv_ctm.d * page_h;
+    char matrix_buf[256];
+    std::snprintf(matrix_buf, sizeof(matrix_buf),
+                  "q\n%.8f %.8f %.8f %.8f %.8f %.8f cm\n", a, b, c, d, e, f);
+    for (char* p = matrix_buf; *p; ++p) if (*p == ',') *p = '.';
+    out_stream.assign(matrix_buf);
+    out_stream.append(content, content_length);
+    out_stream += "\nQ\n";
+    std::free(content);
+    return true;
+}
+
 static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdfDocument* doc, const std::map<int, std::vector<WinInsertTextTask>>& pages_tasks, const std::string& fonts_dir, std::function<void(int, int)> progress_cb, int num_threads_opt, bool fit_by_spacing) {
     if (!doc || pages_tasks.empty()) {
         return {};
@@ -1151,10 +1255,23 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
 
     std::map<int, std::vector<FontSlot*>> precomputed_slots;
     std::map<int, std::vector<std::vector<ShapedLine>>> precomputed_shaped_lines;
+    std::map<int, std::vector<std::string>> precomputed_latex_streams;
     std::set<FontSlot*> all_used_slots;
+    bool has_latex_tasks = false;
     for (const auto& item : pages_tasks) {
         int page_index = item.first;
+        WinExtract::WinPageGeometry page_geometry = doc->get_page_geometry(page_index);
         for (const auto& task : item.second) {
+            std::string latex_stream;
+            if (LooksLikeLatexFormula(task.text) &&
+                RenderLatexTask(page_index, page_geometry, task, latex_stream)) {
+                precomputed_slots[page_index].push_back(nullptr);
+                precomputed_shaped_lines[page_index].emplace_back();
+                precomputed_latex_streams[page_index].push_back(std::move(latex_stream));
+                has_latex_tasks = true;
+                continue;
+            }
+
             auto utf32 = Utf8ToUtf32(task.text);
             
             // Normalize Fullwidth and Typographic characters to ASCII
@@ -1194,6 +1311,7 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
                 task_lines = HarfbuzzWordWrap(clean_text, tracking_font_selector, task.font_size, 1e9f);
             }
             precomputed_shaped_lines[page_index].push_back(std::move(task_lines));
+            precomputed_latex_streams[page_index].emplace_back();
         }
     }
     auto t_font_resolve = std::chrono::high_resolution_clock::now();
@@ -1274,6 +1392,16 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
                 all_font_entries += pdf_name + " " + std::to_string(slot.type0_obj_id) + " 0 R ";
             }
         }
+    }
+    if (has_latex_tasks) {
+        const int latex_normal_font_obj = next_obj_id++;
+        const int latex_italic_font_obj = next_obj_id++;
+        new_objects[latex_normal_font_obj] = std::to_string(latex_normal_font_obj) +
+            " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n";
+        new_objects[latex_italic_font_obj] = std::to_string(latex_italic_font_obj) +
+            " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Italic >>\nendobj\n";
+        all_font_entries += "/" LATEXF_PDF_FONT_NORMAL_NAME " " + std::to_string(latex_normal_font_obj) + " 0 R ";
+        all_font_entries += "/" LATEXF_PDF_FONT_ITALIC_NAME " " + std::to_string(latex_italic_font_obj) + " 0 R ";
     }
     auto t_font_subset = std::chrono::high_resolution_clock::now();
 
@@ -1479,12 +1607,17 @@ static std::vector<uint8_t> InsertTextToMultiplePagesInternal(WinExtract::WinPdf
 
             const std::vector<FontSlot*>& p_slots = precomputed_slots[page_index];
             const auto& page_precomputed_lines = precomputed_shaped_lines[page_index];
+            const auto& page_latex_streams = precomputed_latex_streams[page_index];
             size_t task_idx = 0;
 
             for (const auto& task : tasks) {
                 float bbox_w = task.x1 - task.x0;
                 float bbox_h = task.y1 - task.y0;
                 size_t cur_task_idx = task_idx++;
+                if (cur_task_idx < page_latex_streams.size() && !page_latex_streams[cur_task_idx].empty()) {
+                    page_stream += page_latex_streams[cur_task_idx];
+                    continue;
+                }
                 FontSlot* slot = (cur_task_idx < p_slots.size()) ? p_slots[cur_task_idx] : nullptr;
                 if (bbox_w <= 0 || bbox_h <= 0 || !slot) continue;
 
