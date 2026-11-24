@@ -5,7 +5,7 @@ if(NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 
@@ -82,7 +82,7 @@ add_library(WinnerZ STATIC
     extract_text/pdf_font_metrics.cpp
 )
 set_target_properties(WinnerZ PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_features(WinnerZ PUBLIC cxx_std_17)
+target_compile_features(WinnerZ PUBLIC cxx_std_20)
 if(WIN32)
     target_compile_definitions(WinnerZ PUBLIC NOMINMAX)
 endif()
@@ -204,7 +204,7 @@ if(WINNERZ_BUILD_PYTHON_WRAPPER)
     endif()
 
     pybind11_add_module(winnerz_core wrapper_python/winnerz_python_wrapper.cpp)
-    target_compile_features(winnerz_core PRIVATE cxx_std_17)
+    target_compile_features(winnerz_core PRIVATE cxx_std_20)
     
 
     
@@ -294,7 +294,7 @@ if(EMSCRIPTEN)
 
     add_executable(winnerz_wasm wrapper_wasm/winnerz_wasm_embind.cpp)
 
-    target_compile_features(winnerz_wasm PRIVATE cxx_std_17)
+    target_compile_features(winnerz_wasm PRIVATE cxx_std_20)
 
     target_include_directories(winnerz_wasm PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
