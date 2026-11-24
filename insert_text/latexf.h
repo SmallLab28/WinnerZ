@@ -1116,7 +1116,8 @@ static AstNode *parse_group_or_single_ex(Parser *p, StopFlags f) {
 			mod->text = xstrdup_range("mod", 3);
 			node_add_child(body, mod);
 			node_add_child(body, space);
-			node_add_child(body, parse_seq_ex(&inner, (StopFlags){0}));
+			StopFlags empty_flags = {0};
+			node_add_child(body, parse_seq_ex(&inner, empty_flags));
 			p->steps = inner.steps;
 			free(raw);
 			AstNode *delim = node_new(NODE_DELIM);
